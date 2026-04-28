@@ -209,6 +209,18 @@ export default function App() {
 
       // Load using parakeet.js fromHub
       // This handles file downloads and ONNX Runtime initialization
+      // Load the ASR pipeline with the verified model
+      transcriberRef.current = await pipeline(
+        'automatic-speech-recognition',
+        MODEL_ID,
+        {
+          progress_callback: progressCallback,
+          device: preferredBackend,
+        }
+      );
+
+      // Load the ASR pipeline with the verified model
+      // Add retries for network errors
       let lastError: Error | null = null;
       const maxRetries = 3;
       
