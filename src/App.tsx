@@ -5,7 +5,7 @@ import { pipeline, env } from '@huggingface/transformers';
 env.useBrowserCache = true;
 env.allowLocalModels = true;
 
-const MODEL_ID = 'Xenova/parakeet-v2-0.6B';
+const MODEL_ID = 'Unravler/parakeet-tdt-0.6b-v2-onnx';
 
 // Type for the ASR pipeline
 type ASRPipeline = Awaited<ReturnType<typeof pipeline<'automatic-speech-recognition'>>>;
@@ -438,7 +438,7 @@ export default function App() {
       )}
 
       <footer className="footer">
-        Using Xenova/parakeet-v2-0.6B with WebGPU acceleration
+        Using Unravler/parakeet-tdt-0.6b-v2-onnx with WebGPU acceleration
       </footer>
     </div>
   );

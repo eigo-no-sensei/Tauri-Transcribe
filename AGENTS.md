@@ -15,12 +15,12 @@
 
 ## Important Notes
 - The app uses WebGPU for ML inference - requires browser with WebGPU support
-- Model (parakeet-v2-0.6B) is cached in browser IndexedDB via transformers.js
+- Model (Unravler/parakeet-tdt-0.6b-v2-onnx) is cached in browser IndexedDB via transformers.js
 - The ASR pipeline uses the 'automatic-speech-recognition' task with 'webgpu' device
 - For desktop builds, Linux requires: pkg-config, libglib2.0-dev, libgtk-3-dev, libsoup-3.0-dev, libwebkit2gtk-4.1-dev
 
 ## Model Configuration
-- Model: Xenova/parakeet-v2-0.6B
+- Model: Unravler/parakeet-tdt-0.6b-v2-onnx
 - Task: automatic-speech-recognition
 - Device: webgpu
 - Caching: Browser IndexedDB via env.useBrowserCache = true
