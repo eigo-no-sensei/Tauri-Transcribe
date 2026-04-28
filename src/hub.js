@@ -1,6 +1,8 @@
 /**
  * HuggingFace Hub utilities for loading Parakeet ONNX models.
  * Downloads models and caches them in browser IndexedDB.
+ * 
+ * Debug mode: Set localStorage.setItem('hub-debug', 'true') to enable verbose logging
  */
 
 import { getModelConfig } from './models.js';
@@ -11,6 +13,12 @@ const DB_NAME = 'parakeet-cache-db';
 const STORE_NAME = 'file-store';
 
 let dbPromise = null;
+
+// Enable debug logging
+const DEBUG = typeof window !== 'undefined' && window.localStorage?.getItem('hub-debug') === 'true';
+const log = DEBUG ? console.log.bind(console, '[Hub]') : () => {};
+const warn = DEBUG ? console.warn.bind(console, '[Hub]') : () => {};
+const error = DEBUG ? console.error.bind(console, '[Hub]') : () => {};
 
 // Cache for repo file listings
 const repoFileCache = new Map();
@@ -95,31 +103,40 @@ function repoHasFile(repoFiles, filename) {
  */
 async function listRepoFiles(repoId, revision = 'main') {
   const cacheKey = `${repoId}@${revision}`;
-  if (repoFileCache.has(cacheKey)) return repoFileCache.get(cacheKey);
+  if (repoFileCache.has(cacheKey)) {
+    log('Using cached repo files:', cacheKey);
+    return repoFileCache.get(cacheKey);
+  }
 
   const encodedRepoId = encodeRepoPath(repoId);
   const encodedRevision = encodeURIComponent(revision);
   const treeUrl = `https://huggingface.co/api/models/${encodedRepoId}/tree/${encodedRevision}?recursive=1`;
   const modelUrl = `https://huggingface.co/api/models/${encodedRepoId}?revision=${encodedRevision}`;
 
+  log('Fetching repo files from HF API:', repoId);
+
   try {
+    log('Trying tree API:', treeUrl);
     const resp = await fetch(treeUrl);
     if (!resp.ok) throw new Error(`Tree API: ${resp.status}`);
     const files = parseRepoListingPayload(await resp.json());
+    log('Tree API success:', repoId, `(${files.length} files)`);
     repoFileCache.set(cacheKey, files);
     return files;
   } catch (treeErr) {
-    console.warn('[Hub] Tree API failed, trying metadata', treeErr);
+    warn('Tree API failed, trying metadata:', treeErr);
   }
 
   try {
+    log('Trying metadata API:', modelUrl);
     const resp = await fetch(modelUrl);
     if (!resp.ok) throw new Error(`Metadata API: ${resp.status}`);
     const files = parseRepoListingPayload(await resp.json());
+    log('Metadata API success:', repoId, `(${files.length} files)`);
     repoFileCache.set(cacheKey, files);
     return files;
   } catch (metadataErr) {
-    console.warn('[Hub] Metadata API failed', metadataErr);
+    error('Metadata API failed:', metadataErr);
     return null;
   }
 }
@@ -130,12 +147,20 @@ async function listRepoFiles(repoId, revision = 'main') {
  */
 function getDb() {
   if (!dbPromise) {
+    log('Opening IndexedDB:', DB_NAME);
     dbPromise = new Promise((resolve, reject) => {
       const request = indexedDB.open(DB_NAME, 1);
-      request.onerror = () => reject('Error opening IndexedDB');
-      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => {
+        error('Failed to open IndexedDB:', request.error);
+        reject('Error opening IndexedDB');
+      };
+      request.onsuccess = () => {
+        log('IndexedDB opened successfully');
+        resolve(request.result);
+      };
       request.onupgradeneeded = (event) => {
         const db = event.target.result;
+        log('IndexedDB upgrade needed, creating store');
         if (!db.objectStoreNames.contains(STORE_NAME)) {
           db.createObjectStore(STORE_NAME);
         }
@@ -152,17 +177,26 @@ function getDb() {
  * @returns {Promise<Blob|null>}
  */
 async function getCachedFile(repoId, filename) {
+  const key = `${repoId}/${filename}`;
+  log('Checking cache for:', key);
   try {
     const db = await getDb();
     return new Promise((resolve, reject) => {
       const tx = db.transaction(STORE_NAME, 'readonly');
       const store = tx.objectStore(STORE_NAME);
-      const key = `${repoId}/${filename}`;
       const request = store.get(key);
-      request.onerror = () => reject(request.error);
-      request.onsuccess = () => resolve(request.result || null);
+      request.onerror = () => {
+        error('Cache read error:', request.error);
+        reject(request.error);
+      };
+      request.onsuccess = () => {
+        const result = request.result || null;
+        log('Cache result for', key + ':', result ? `HIT (${result.size} bytes)` : 'MISS');
+        resolve(result);
+      };
     });
-  } catch {
+  } catch (err) {
+    error('Cache read failed:', err);
     return null;
   }
 }
@@ -174,18 +208,25 @@ async function getCachedFile(repoId, filename) {
  * @param {Blob} blob
  */
 async function cacheFile(repoId, filename, blob) {
+  const key = `${repoId}/${filename}`;
+  log('Caching file:', key, `(${blob.size} bytes)`);
   try {
     const db = await getDb();
     return new Promise((resolve, reject) => {
       const tx = db.transaction(STORE_NAME, 'readwrite');
       const store = tx.objectStore(STORE_NAME);
-      const key = `${repoId}/${filename}`;
       const request = store.put(blob, key);
-      request.onerror = () => reject(request.error);
-      request.onsuccess = () => resolve();
+      request.onerror = () => {
+        error('Cache write error:', request.error);
+        reject(request.error);
+      };
+      request.onsuccess = () => {
+        log('Cached successfully:', key);
+        resolve();
+      };
     });
   } catch (err) {
-    console.warn('[Hub] Failed to cache file:', err);
+    warn('Cache write failed (non-fatal):', err);
   }
 }
 
@@ -205,7 +246,7 @@ async function getModelFile(repoId, filename, options = {}) {
   // Check cache first
   const cached = await getCachedFile(repoId, filename);
   if (cached) {
-    console.log(`[Hub] Using cached: ${filename}`);
+    log('Using cached file:', filename);
     return URL.createObjectURL(cached);
   }
 
@@ -214,36 +255,47 @@ async function getModelFile(repoId, filename, options = {}) {
   const revision = options.revision || 'main';
   const url = `https://huggingface.co/${encodedRepoId}/resolve/${revision}/${filename}`;
 
-  console.log(`[Hub] Downloading: ${filename}`);
+  log('Downloading:', filename, 'from', url);
 
   const response = await fetch(url);
   if (!response.ok) {
+    error('Download failed:', filename, 'status:', response.status);
     throw new Error(`Failed to download ${filename}: ${response.status}`);
   }
 
   const total = Number(response.headers.get('content-length') || 0);
+  log('File size:', filename, total ? `${total} bytes` : 'unknown');
   let loaded = 0;
 
   // Handle progress for streaming response
   if (progress && total) {
     const reader = response.body?.getReader();
     if (reader) {
+      log('Streaming download:', filename);
       const chunks = [];
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        chunks.push(value);
-        loaded += value.length;
-        progress({ loaded, total, file: filename });
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+          loaded += value.length;
+          progress({ loaded, total, file: filename });
+        }
+        const blob = new Blob(chunks);
+        log('Download complete:', filename, `(${blob.size} bytes)`);
+        await cacheFile(repoId, filename, blob);
+        return URL.createObjectURL(blob);
+      } catch (streamErr) {
+        error('Stream error:', filename, streamErr);
+        throw streamErr;
       }
-      const blob = new Blob(chunks);
-      await cacheFile(repoId, filename, blob);
-      return URL.createObjectURL(blob);
     }
   }
 
   // Fallback: simple download
+  log('Simple download:', filename);
   const blob = await response.blob();
+  log('Downloaded:', filename, `(${blob.size} bytes)`);
   await cacheFile(repoId, filename, blob);
   return URL.createObjectURL(blob);
 }
@@ -336,6 +388,7 @@ function buildOptionalExternalDataDownloads(components, repoFiles) {
  * @returns {Promise<Object>}
  */
 export async function getParakeetModel(repoIdOrModelKey, options = {}) {
+  log('getParakeetModel called:', repoIdOrModelKey, options);
   const modelConfig = getModelConfig(repoIdOrModelKey);
   const repoId = modelConfig?.repoId || repoIdOrModelKey;
   const defaultPreprocessor = modelConfig?.preprocessor || 'nemo128';
@@ -355,21 +408,26 @@ export async function getParakeetModel(repoIdOrModelKey, options = {}) {
     backend = 'wasm';
   }
   if (backend.startsWith('webgpu') && encoderQ === 'int8') {
-    console.warn('[Hub] Forcing encoder to fp32 on WebGPU (int8 unsupported)');
+    warn('Forcing encoder to fp32 on WebGPU (int8 unsupported)');
     encoderQ = 'fp32';
   }
+
+  log('Model config:', { repoId, encoderQ, decoderQuant, preprocessorBackend, backend });
 
   const components = {
     encoder: createComponent('encoder', encoderQ),
     decoder: createComponent('decoder', decoderQuant),
   };
 
+  log('Fetching repo files...');
   const repoFiles = await listRepoFiles(repoId, options.revision || 'main');
+  log('Repo files:', repoFiles?.length || 0, 'files');
 
   validateRequestedFp16Component(components.encoder, repoId, repoFiles);
   validateRequestedFp16Component(components.decoder, repoId, repoFiles);
 
   const requiredFiles = buildRequiredDownloads(components, preprocessorBackend, defaultPreprocessor);
+  log('Required files:', requiredFiles.map(f => f.name));
 
   const results = {
     urls: {},
