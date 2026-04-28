@@ -39,20 +39,6 @@ export const LANGUAGE_NAMES = {
  * @type {Object.<string, ModelConfig>}
  */
 export const MODELS = {
-  // Whisper - fully supported by transformers.js v4
-  'whisper-tiny': {
-    repoId: 'Xenova/whisper-tiny.en',
-    displayName: 'Whisper Tiny (English)',
-    languages: ['en'],
-    defaultLanguage: 'en',
-    vocabSize: 51865,
-    featuresSize: 80,
-    preprocessor: 'default',
-    subsampling: 1,
-    predHidden: 384,
-    predLayers: 4,
-  },
-  // Fallback to Parakeet if needed
   'parakeet-tdt-0.6b-v2': {
     repoId: 'istupakov/parakeet-tdt-0.6b-v2-onnx',
     displayName: 'Parakeet TDT 0.6B v2 (English)',
@@ -67,8 +53,8 @@ export const MODELS = {
   },
 };
 
-/** Default model - use Whisper for now (supported by transformers.js) */
-export const DEFAULT_MODEL = 'whisper-tiny';
+/** Default model */
+export const DEFAULT_MODEL = 'parakeet-tdt-0.6b-v2';
 
 /**
  * Get model configuration by key or repo ID
