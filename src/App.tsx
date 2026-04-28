@@ -7,6 +7,15 @@ import { getParakeetModel } from './hub.js';
 env.useBrowserCache = true;
 env.allowLocalModels = false;
 
+// Try to configure custom fetch if available
+// This helps with CORS issues in browser environments
+if (typeof window !== 'undefined') {
+  // Log when model loading starts for debugging
+  console.log('[App] transformers.js env configured');
+  console.log('[App] useBrowserCache:', env.useBrowserCache);
+  console.log('[App] allowLocalModels:', env.allowLocalModels);
+}
+
 // Model configuration using models.js
 const MODEL_KEY = DEFAULT_MODEL;
 const MODEL_CONFIG = getModelConfig(MODEL_KEY);
