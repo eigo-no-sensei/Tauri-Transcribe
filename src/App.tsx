@@ -1,32 +1,19 @@
 import { useState, useRef, useCallback, useEffect, type FC } from 'react';
-import { pipeline, env } from '@huggingface/transformers';
-import { getModelConfig, DEFAULT_MODEL } from './models.js';
-import { getParakeetModel } from './hub.js';
+// @ts-ignore - parakeet.js is loaded as ES modules
+import { fromHub, ParakeetModel, getParakeetModel, getModelConfig, MODELS, DEFAULT_MODEL } from './index.js';
 
-// Configure transformers.js
-env.useBrowserCache = true;
-env.allowLocalModels = false;
-
-// Try to configure custom fetch if available
-// This helps with CORS issues in browser environments
-if (typeof window !== 'undefined') {
-  // Log when model loading starts for debugging
-  console.log('[App] transformers.js env configured');
-  console.log('[App] useBrowserCache:', env.useBrowserCache);
-  console.log('[App] allowLocalModels:', env.allowLocalModels);
-}
-
-// Model configuration using models.js
+// Use parakeet.js for inference
 const MODEL_KEY = DEFAULT_MODEL;
 const MODEL_CONFIG = getModelConfig(MODEL_KEY);
-const MODEL_ID = MODEL_CONFIG?.repoId || 'Unravler/parakeet-tdt-0.6b-v2-onnx';
+const MODEL_ID = MODEL_CONFIG?.repoId || 'ysdede/parakeet-tdt-0.6b-v2-onnx';
 
-// Available backends
-const AVAILABLE_BACKENDS = ['webgpu', 'cpu'] as const;
-type BackendType = typeof AVAILABLE_BACKENDS[number];
+// Available backends - parakeet.js supports webgpu-hybrid and wasm
+const AVAILABLE_BACKENDS = ['webgpu-hybrid', 'wasm'] as const;
+type BackendType = typeof AVAILABLE_BACKENDS[number] | 'cpu';
 
-// Type for the ASR pipeline
-type ASRPipeline = Awaited<ReturnType<typeof pipeline<'automatic-speech-recognition'>>>;
+// Type for Parakeet model - using any to bypass strict typing
+// @ts-ignore
+type ASRPipeline = ParakeetModel;
 
 const SUPPORTED_AUDIO = ['.mp3', '.wav', '.ogg', '.flac', '.m4a', '.aac'];
 const SUPPORTED_VIDEO = ['.mp4', '.webm', '.mov', '.avi', '.mkv'];
@@ -101,7 +88,7 @@ export default function App() {
   const [isDragOver, setIsDragOver] = useState(false);
   
   // Check WebGPU availability and preferred backend
-  const [preferredBackend, setPreferredBackend] = useState<BackendType>('webgpu');
+  const [preferredBackend, setPreferredBackend] = useState<BackendType>('webgpu-hybrid');
   
   const fileInputRef = useRef<HTMLInputElement>(null);
   const transcriberRef = useRef<ASRPipeline | null>(null);
@@ -220,6 +207,8 @@ export default function App() {
 
       setStatusMessage(`Loading model with ${preferredBackend} backend...`);
 
+      // Load using parakeet.js fromHub
+      // This handles file downloads and ONNX Runtime initialization
       // Load the ASR pipeline with the verified model
       transcriberRef.current = await pipeline(
         'automatic-speech-recognition',
@@ -239,14 +228,15 @@ export default function App() {
         try {
           setStatusMessage(`Loading model (attempt ${attempt}/${maxRetries})...`);
           
-          transcriberRef.current = await pipeline(
-            'automatic-speech-recognition',
-            MODEL_ID,
-            {
-              progress_callback: progressCallback,
-              device: preferredBackend,
-            }
-          );
+          // Use parakeet.js fromHub to load the model
+          transcriberRef.current = await fromHub(MODEL_ID, {
+            backend: preferredBackend,
+            progress: (p: { status?: string; progress?: number; file?: string }) => {
+              if (p?.status) setStatusMessage(p.status);
+              if (p?.file) setStatusMessage(`Downloading ${p.file}...`);
+              if (p?.progress !== undefined) setProgress(Math.round(p.progress * 100));
+            },
+          });
           
           setModelStatus('ready');
           setProgress(100);
@@ -274,33 +264,29 @@ export default function App() {
     } catch (error) {
       console.error('[Model] Loading error:', error);
       
-      // If WebGPU failed, try with CPU fallback
-      if (preferredBackend === 'webgpu' && error instanceof Error) {
-        console.warn('[Model] WebGPU failed, retrying with CPU...');
-        setPreferredBackend('cpu');
+      // If WebGPU failed, try with WASM fallback
+      if (preferredBackend.startsWith('webgpu') && error instanceof Error) {
+        console.warn('[Model] WebGPU failed, retrying with WASM...');
+        setPreferredBackend('wasm');
         setModelStatus('idle');
         setProgress(0);
-        setStatusMessage('WebGPU failed, retrying with CPU...');
+        setStatusMessage('WebGPU failed, retrying with WASM...');
         
         try {
-          transcriberRef.current = await pipeline(
-            'automatic-speech-recognition',
-            MODEL_ID,
-            {
-              progress_callback: (p: { status?: string; progress?: number; file?: string }) => {
-                if (p.status) setStatusMessage(p.status);
-                if (p.file) setStatusMessage(`Downloading ${p.file}...`);
-                if (p.progress !== undefined) setProgress(Math.round(p.progress * 100));
-              },
-              device: 'cpu',
-            }
-          );
+          transcriberRef.current = await fromHub(MODEL_ID, {
+            backend: 'wasm',
+            progress: (p: { status?: string; progress?: number; file?: string }) => {
+              if (p?.status) setStatusMessage(p.status);
+              if (p?.file) setStatusMessage(`Downloading ${p.file}...`);
+              if (p?.progress !== undefined) setProgress(Math.round(p.progress * 100));
+            },
+          });
           setModelStatus('ready');
           setProgress(100);
-          setStatusMessage('Model ready (CPU mode)');
-          setToast({ message: 'Model loaded with CPU fallback', type: 'success' });
+          setStatusMessage('Model ready (WASM mode)');
+          setToast({ message: 'Model loaded with WASM fallback', type: 'success' });
         } catch (cpuError) {
-          console.error('[Model] CPU fallback error:', cpuError);
+          console.error('[Model] WASM fallback error:', cpuError);
           setModelStatus('error');
           setStatusMessage(cpuError instanceof Error ? cpuError.message : 'Failed to load model');
           setToast({ message: 'Failed to load model', type: 'error' });
@@ -327,21 +313,16 @@ export default function App() {
       
       setStatusMessage('Processing audio...');
       
-      // Transcribe using transformers.js pipeline - use file URL
-      const audioUrl = URL.createObjectURL(selectedFile.file);
-      const result = await transcriberRef.current(audioUrl, {
-        max_new_tokens: 48000,
-        chunk_length_s: 30,
-        stride_length_s: 5,
-        return_timestamps: true,
-      });
+      // Load and transcribe audio using parakeet.js
+      const audioBuffer = await selectedFile.file.arrayBuffer();
+      const audioData = new Float32Array(audioBuffer);
       
-      // Clean up the URL
-      URL.revokeObjectURL(audioUrl);
+      // Use parakeet.js transcribe method
+      const result = await transcriberRef.current.transcribe(audioData);
       
       const processingTime = Date.now() - startTimeRef.current;
-      const output = result as { text: string };
-      const text = output.text;
+      // parakeet.js returns { utterance_text, words, tokens, ... }
+      const text = result.utterance_text || '';
       
       setTranscription(text);
       

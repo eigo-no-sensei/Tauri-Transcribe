@@ -1,26 +1,17 @@
 /**
- * HuggingFace Hub utilities for loading Parakeet ONNX models.
- * Downloads models and caches them in browser IndexedDB.
- * 
- * Debug mode: Set localStorage.setItem('hub-debug', 'true') to enable verbose logging
+ * Simplified HuggingFace Hub utilities for parakeet.js
+ * Downloads models from HF and caches them in browser storage.
  */
 
 import { getModelConfig } from './models.js';
-
 /** @typedef {import('./models.js').ModelConfig} ModelConfig */
 
 const DB_NAME = 'parakeet-cache-db';
 const STORE_NAME = 'file-store';
-
 let dbPromise = null;
 
-// Enable debug logging
-const DEBUG = typeof window !== 'undefined' && window.localStorage?.getItem('hub-debug') === 'true';
-const log = DEBUG ? console.log.bind(console, '[Hub]') : () => {};
-const warn = DEBUG ? console.warn.bind(console, '[Hub]') : () => {};
-const error = DEBUG ? console.error.bind(console, '[Hub]') : () => {};
-
-// Cache for repo file listings
+// Cache for repo file listings so we only hit the HF API once per page load.
+// Cache successful lookups only. Failed lookups intentionally do not cache.
 const repoFileCache = new Map();
 
 const QUANT_SUFFIX = {
@@ -30,20 +21,22 @@ const QUANT_SUFFIX = {
 };
 
 /**
- * @param {string} baseName
- * @param {('int8'|'fp32'|'fp16')} quant
- * @returns {string}
+ * @param {string} baseName - Base filename (e.g. 'encoder-model').
+ * @param {('int8'|'fp32'|'fp16')} quant - Quantization key.
+ * @returns {string} Filename with quant suffix (e.g. 'encoder-model.fp16.onnx').
  */
 function getQuantizedModelName(baseName, quant) {
   const suffix = QUANT_SUFFIX[quant];
   if (!suffix) {
-    throw new Error(`[Hub] Unknown quantization '${quant}'`);
+    throw new Error(
+      `[Hub] Unknown quantization '${quant}'; expected one of: ${Object.keys(QUANT_SUFFIX).join(', ')}`
+    );
   }
   return `${baseName}${suffix}`;
 }
 
 /**
- * Encode HF repo path
+ * Encode an HF repo path (org/name) by segments.
  * @param {string} repoId
  * @returns {string}
  */
@@ -55,17 +48,18 @@ function encodeRepoPath(repoId) {
 }
 
 /**
- * Normalize path entry
+ * Normalize HF tree/metadata path entry.
  * @param {string} path
  * @returns {string}
  */
 function normalizeRepoPath(path) {
   if (typeof path !== 'string') return '';
-  return path.replace(/^\.\//, '').replace(/\\/g, '/');
+  const normalized = path.replace(/^\.\//, '').replace(/\\/g, '/');
+  return normalized;
 }
 
 /**
- * Parse file listing from HF API
+ * Parse file listing payload from HF tree or metadata endpoints.
  * @param {unknown} payload
  * @returns {string[]}
  */
@@ -75,16 +69,18 @@ function parseRepoListingPayload(payload) {
       .filter((entry) => entry?.type === 'file' && typeof entry?.path === 'string')
       .map((entry) => normalizeRepoPath(entry.path));
   }
+
   if (payload && typeof payload === 'object' && Array.isArray(payload.siblings)) {
     return payload.siblings
       .map((entry) => normalizeRepoPath(entry?.rfilename))
       .filter(Boolean);
   }
+
   return [];
 }
 
 /**
- * Check if repo contains a file
+ * Whether a listing contains a given filename at repo root or in nested path.
  * @param {string[]|null} repoFiles
  * @param {string} filename
  * @returns {boolean}
@@ -96,71 +92,58 @@ function repoHasFile(repoFiles, filename) {
 }
 
 /**
- * List model repository files
- * @param {string} repoId
- * @param {string} [revision='main']
- * @returns {Promise<string[]|null>}
+ * List model repository files from the Hugging Face model API.
+ *
+ * Returns `null` when listing is unavailable (network/API failure), which is
+ * distinct from an empty successful listing (`[]`).
+ *
+ * @param {string} repoId - Hugging Face repository ID.
+ * @param {string} [revision='main'] - Git revision/branch/tag.
+ * @returns {Promise<string[]|null>} Repository file paths, or `null` if listing could not be obtained.
  */
 async function listRepoFiles(repoId, revision = 'main') {
   const cacheKey = `${repoId}@${revision}`;
-  if (repoFileCache.has(cacheKey)) {
-    log('Using cached repo files:', cacheKey);
-    return repoFileCache.get(cacheKey);
-  }
+  if (repoFileCache.has(cacheKey)) return repoFileCache.get(cacheKey);
 
   const encodedRepoId = encodeRepoPath(repoId);
   const encodedRevision = encodeURIComponent(revision);
   const treeUrl = `https://huggingface.co/api/models/${encodedRepoId}/tree/${encodedRevision}?recursive=1`;
   const modelUrl = `https://huggingface.co/api/models/${encodedRepoId}?revision=${encodedRevision}`;
 
-  log('Fetching repo files from HF API:', repoId);
-
   try {
-    log('Trying tree API:', treeUrl);
     const resp = await fetch(treeUrl);
-    if (!resp.ok) throw new Error(`Tree API: ${resp.status}`);
+    if (!resp.ok) throw new Error(`Failed to list repo files from tree API: ${resp.status}`);
     const files = parseRepoListingPayload(await resp.json());
-    log('Tree API success:', repoId, `(${files.length} files)`);
     repoFileCache.set(cacheKey, files);
     return files;
   } catch (treeErr) {
-    warn('Tree API failed, trying metadata:', treeErr);
+    console.warn('[Hub] Could not fetch repo tree listing; trying model metadata listing', treeErr);
   }
 
   try {
-    log('Trying metadata API:', modelUrl);
     const resp = await fetch(modelUrl);
-    if (!resp.ok) throw new Error(`Metadata API: ${resp.status}`);
+    if (!resp.ok) throw new Error(`Failed to list repo files from metadata API: ${resp.status}`);
     const files = parseRepoListingPayload(await resp.json());
-    log('Metadata API success:', repoId, `(${files.length} files)`);
     repoFileCache.set(cacheKey, files);
     return files;
   } catch (metadataErr) {
-    error('Metadata API failed:', metadataErr);
+    console.warn('[Hub] Could not fetch repo file list – falling back to optimistic fetch', metadataErr);
     return null;
   }
 }
 
 /**
- * Get (or initialize) IndexedDB
- * @returns {Promise<IDBDatabase>}
+ * Get (or initialize) the IndexedDB database handle used for caching.
+ * @returns {Promise<IDBDatabase>} Open IndexedDB database instance.
  */
 function getDb() {
   if (!dbPromise) {
-    log('Opening IndexedDB:', DB_NAME);
     dbPromise = new Promise((resolve, reject) => {
       const request = indexedDB.open(DB_NAME, 1);
-      request.onerror = () => {
-        error('Failed to open IndexedDB:', request.error);
-        reject('Error opening IndexedDB');
-      };
-      request.onsuccess = () => {
-        log('IndexedDB opened successfully');
-        resolve(request.result);
-      };
+      request.onerror = () => reject('Error opening IndexedDB');
+      request.onsuccess = () => resolve(request.result);
       request.onupgradeneeded = (event) => {
         const db = event.target.result;
-        log('IndexedDB upgrade needed, creating store');
         if (!db.objectStoreNames.contains(STORE_NAME)) {
           db.createObjectStore(STORE_NAME);
         }
@@ -171,140 +154,152 @@ function getDb() {
 }
 
 /**
- * Get cached file from IndexedDB
- * @param {string} repoId
- * @param {string} filename
- * @returns {Promise<Blob|null>}
+ * Read a cached file blob from IndexedDB.
+ * @param {string} key - Cache key.
+ * @returns {Promise<Blob|undefined>} Cached blob if found.
  */
-async function getCachedFile(repoId, filename) {
-  const key = `${repoId}/${filename}`;
-  log('Checking cache for:', key);
-  try {
-    const db = await getDb();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE_NAME, 'readonly');
-      const store = tx.objectStore(STORE_NAME);
-      const request = store.get(key);
-      request.onerror = () => {
-        error('Cache read error:', request.error);
-        reject(request.error);
-      };
-      request.onsuccess = () => {
-        const result = request.result || null;
-        log('Cache result for', key + ':', result ? `HIT (${result.size} bytes)` : 'MISS');
-        resolve(result);
-      };
-    });
-  } catch (err) {
-    error('Cache read failed:', err);
-    return null;
-  }
+async function getFileFromDb(key) {
+  const db = await getDb();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORE_NAME], 'readonly');
+    const store = transaction.objectStore(STORE_NAME);
+    const request = store.get(key);
+    request.onerror = () => reject('Error reading from DB');
+    request.onsuccess = () => resolve(request.result);
+  });
 }
 
 /**
- * Cache file to IndexedDB
- * @param {string} repoId
- * @param {string} filename
- * @param {Blob} blob
+ * Save a file blob into IndexedDB.
+ * @param {string} key - Cache key.
+ * @param {Blob} blob - Blob to store.
+ * @returns {Promise<IDBValidKey | undefined>} IndexedDB request result.
  */
-async function cacheFile(repoId, filename, blob) {
-  const key = `${repoId}/${filename}`;
-  log('Caching file:', key, `(${blob.size} bytes)`);
-  try {
-    const db = await getDb();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE_NAME, 'readwrite');
-      const store = tx.objectStore(STORE_NAME);
-      const request = store.put(blob, key);
-      request.onerror = () => {
-        error('Cache write error:', request.error);
-        reject(request.error);
-      };
-      request.onsuccess = () => {
-        log('Cached successfully:', key);
-        resolve();
-      };
-    });
-  } catch (err) {
-    warn('Cache write failed (non-fatal):', err);
-  }
+async function saveFileToDb(key, blob) {
+  const db = await getDb();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORE_NAME], 'readwrite');
+    const store = transaction.objectStore(STORE_NAME);
+    const request = store.put(blob, key);
+    request.onerror = () => reject('Error writing to DB');
+    request.onsuccess = () => resolve(request.result);
+  });
 }
 
 /**
- * Get model file with caching
- * @param {string} repoId
- * @param {string} filename
+ * Download a file from HuggingFace Hub with caching support.
+ *
+ * NOTE:
+ * - `filename` and `subfolder` must be raw (not URL-encoded) path segments.
+ * - This function performs per-segment encoding internally.
+ * - Passing pre-encoded values may cause double-encoding.
+ *
+ * @param {string} repoId Model repo ID (e.g., 'nvidia/parakeet-tdt-1.1b').
+ * @param {string} filename File to download (e.g., 'encoder-model.onnx').
  * @param {Object} [options]
- * @param {('int8'|'fp32'|'fp16')} [options.quant]
- * @param {string} [options.revision]
- * @param {(progress: {loaded: number, total: number, file: string}) => void} [options.progress]
- * @returns {Promise<string>} Blob URL
+ * @param {string} [options.revision='main'] Git revision.
+ * @param {string} [options.subfolder=''] Subfolder within repo.
+ * @param {(progress: {loaded: number, total: number, file: string}) => void} [options.progress] Progress callback.
+ * @returns {Promise<string>} URL to cached file (blob URL).
  */
-async function getModelFile(repoId, filename, options = {}) {
-  const { progress } = options;
+export async function getModelFile(repoId, filename, options = {}) {
+  const { revision = 'main', subfolder = '', progress } = options;
+  const encodedRevision = encodeURIComponent(revision);
+  const encodedSubfolder = subfolder
+    ? subfolder.split('/').map((part) => encodeURIComponent(part)).join('/')
+    : '';
+  const encodedFilename = filename
+    .split('/')
+    .map((part) => encodeURIComponent(part))
+    .join('/');
 
-  // Check cache first
-  const cached = await getCachedFile(repoId, filename);
-  if (cached) {
-    log('Using cached file:', filename);
-    return URL.createObjectURL(cached);
-  }
+  const baseUrl = 'https://huggingface.co';
+  const pathParts = [encodeRepoPath(repoId), 'resolve', encodedRevision];
+  if (encodedSubfolder) pathParts.push(encodedSubfolder);
+  pathParts.push(encodedFilename);
+  const url = `${baseUrl}/${pathParts.join('/')}`;
 
-  // Download from HuggingFace
-  const encodedRepoId = encodeRepoPath(repoId);
-  const revision = options.revision || 'main';
-  const url = `https://huggingface.co/${encodedRepoId}/resolve/${revision}/${filename}`;
+  const cacheKey = `hf-${repoId}-${revision}-${subfolder}-${filename}`;
 
-  log('Downloading:', filename, 'from', url);
-
-  const response = await fetch(url);
-  if (!response.ok) {
-    error('Download failed:', filename, 'status:', response.status);
-    throw new Error(`Failed to download ${filename}: ${response.status}`);
-  }
-
-  const total = Number(response.headers.get('content-length') || 0);
-  log('File size:', filename, total ? `${total} bytes` : 'unknown');
-  let loaded = 0;
-
-  // Handle progress for streaming response
-  if (progress && total) {
-    const reader = response.body?.getReader();
-    if (reader) {
-      log('Streaming download:', filename);
-      const chunks = [];
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          chunks.push(value);
-          loaded += value.length;
-          progress({ loaded, total, file: filename });
-        }
-        const blob = new Blob(chunks);
-        log('Download complete:', filename, `(${blob.size} bytes)`);
-        await cacheFile(repoId, filename, blob);
-        return URL.createObjectURL(blob);
-      } catch (streamErr) {
-        error('Stream error:', filename, streamErr);
-        throw streamErr;
+  if (typeof indexedDB !== 'undefined') {
+    try {
+      const cachedBlob = await getFileFromDb(cacheKey);
+      if (cachedBlob) {
+        console.log(`[Hub] Using cached ${filename} from IndexedDB`);
+        return URL.createObjectURL(cachedBlob);
       }
+    } catch (e) {
+      console.warn('[Hub] IndexedDB cache check failed:', e);
     }
   }
 
-  // Fallback: simple download
-  log('Simple download:', filename);
-  const blob = await response.blob();
-  log('Downloaded:', filename, `(${blob.size} bytes)`);
-  await cacheFile(repoId, filename, blob);
+  console.log(`[Hub] Downloading ${filename} from ${repoId}...`);
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Failed to download ${filename}: ${response.status} ${response.statusText}`);
+  }
+
+  const contentLength = response.headers.get('content-length');
+  const total = contentLength ? parseInt(contentLength, 10) : 0;
+  let loaded = 0;
+
+  const reader = response.body.getReader();
+  const chunks = [];
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    chunks.push(value);
+    loaded += value.length;
+
+    if (progress && total > 0) {
+      progress({ loaded, total, file: filename });
+    }
+  }
+
+  const blob = new Blob(chunks, { type: response.headers.get('content-type') || 'application/octet-stream' });
+
+  if (typeof indexedDB !== 'undefined') {
+    try {
+      await saveFileToDb(cacheKey, blob);
+      console.log(`[Hub] Cached ${filename} in IndexedDB`);
+    } catch (e) {
+      console.warn('[Hub] Failed to cache in IndexedDB:', e);
+    }
+  }
+
   return URL.createObjectURL(blob);
 }
 
 /**
- * Create model component config
+ * Download text file from HF Hub.
+ * @param {string} repoId Model repo ID.
+ * @param {string} filename Text file to download.
+ * @param {Object} [options] Same as getModelFile.
+ * @returns {Promise<string>} File content as text.
+ */
+export async function getModelText(repoId, filename, options = {}) {
+  const blobUrl = await getModelFile(repoId, filename, options);
+  const response = await fetch(blobUrl);
+  const text = await response.text();
+  URL.revokeObjectURL(blobUrl);
+  return text;
+}
+
+/**
+ * @typedef {Object} ResolvedComponent
+ * @property {'encoder'|'decoder'} name
+ * @property {'encoderUrl'|'decoderUrl'} key
+ * @property {string} baseName
+ * @property {'int8'|'fp32'|'fp16'} quant
+ * @property {string} filename
+ */
+
+/**
  * @param {'encoder'|'decoder'} name
  * @param {'int8'|'fp32'|'fp16'} quant
- * @returns {Object}
+ * @returns {ResolvedComponent}
  */
 function createComponent(name, quant) {
   const baseName = name === 'encoder' ? 'encoder-model' : 'decoder_joint-model';
@@ -319,8 +314,10 @@ function createComponent(name, quant) {
 }
 
 /**
- * Validate FP16 component exists
- * @param {Object} component
+ * Validate requested FP16 component exists when listing is available.
+ * Does not mutate quantization choice; throws actionable errors instead.
+ *
+ * @param {ResolvedComponent} component
  * @param {string} repoId
  * @param {string[]|null} repoFiles
  */
@@ -334,101 +331,114 @@ function validateRequestedFp16Component(component, repoId, repoFiles) {
 
   if (repoHasFile(repoFiles, fp32Name)) {
     throw new Error(
-      `[Hub] ${component.name} FP16 missing in ${repoId} (found ${fp32Name}). Use fp32 explicitly.`
+      `[Hub] ${component.name} FP16 file is missing in ${repoId} (found ${fp32Name} instead). ` +
+      `Requested quantization is strict; choose encoderQuant/decoderQuant='fp32' explicitly.`
     );
   }
 
-  throw new Error(`[Hub] Missing ${component.name} model: ${fp16Name}`);
+  throw new Error(
+    `[Hub] Missing ${component.name} model in ${repoId}: requested ${fp16Name}.`
+  );
 }
 
 /**
- * Get all required download files
- * @param {Object} components
+ * @param {{encoder: ResolvedComponent, decoder: ResolvedComponent}} components
  * @param {'js'|'onnx'} preprocessorBackend
- * @param {string} preprocessor
- * @returns {Array}
+ * @param {'nemo80'|'nemo128'} preprocessor
+ * @returns {Array<{key: string, name: string, componentName?: 'encoder'|'decoder', optional?: boolean}>}
  */
-function buildRequiredDownloads(components, preprocessorBackend, preprocessor) {
+function buildRequiredDownloads(components, preprocessorBackend, preprocessor, verbose = false) {
   const files = [
-    { key: 'configUrl', name: 'config.json', optional: false },
-    { key: components.encoder.key, name: components.encoder.filename, componentName: 'encoder', optional: false },
-    { key: components.decoder.key, name: components.decoder.filename, componentName: 'decoder', optional: false },
+    {
+      key: components.encoder.key,
+      name: components.encoder.filename,
+      componentName: 'encoder',
+      optional: false,
+    },
+    {
+      key: components.decoder.key,
+      name: components.decoder.filename,
+      componentName: 'decoder',
+      optional: false,
+    },
     { key: 'tokenizerUrl', name: 'vocab.txt', optional: false },
   ];
 
   if (preprocessorBackend !== 'js') {
     files.push({ key: 'preprocessorUrl', name: `${preprocessor}.onnx`, optional: false });
+    if (verbose) console.log(`[Hub] Preprocessor: ONNX — will download ${preprocessor}.onnx`);
+  } else {
+    if (verbose) console.log(`[Hub] Preprocessor: JS (mel.js) — skipping ${preprocessor}.onnx download`);
   }
 
   return files;
 }
 
 /**
- * Get optional external data files
- * @param {Object} components
+ * @param {{encoder: ResolvedComponent, decoder: ResolvedComponent}} components
  * @param {string[]|null} repoFiles
- * @returns {Array}
+ * @returns {Array<{key: 'encoderDataUrl'|'decoderDataUrl', name: string, optional: true}>}
  */
 function buildOptionalExternalDataDownloads(components, repoFiles) {
   const candidates = [
     { key: 'encoderDataUrl', name: `${components.encoder.filename}.data`, optional: true },
     { key: 'decoderDataUrl', name: `${components.decoder.filename}.data`, optional: true },
   ];
+
+  // When listing is unavailable, skip optimistic .data fetches to avoid extra 404 round-trips.
   if (repoFiles === null) return [];
   return candidates.filter((entry) => repoHasFile(repoFiles, entry.name));
 }
 
 /**
- * Get Parakeet model files.
- * @param {string} repoIdOrModelKey - HF repo ID or model key
+ * Convenience function to get all Parakeet model files for a given architecture.
+ *
+ * Quantization behavior:
+ * - Requested quantization is strict (no automatic FP16 -> FP32 fallback in core API).
+ * - If requested files are missing, throws actionable errors.
+ *
+ * @param {string} repoIdOrModelKey HF repo (e.g., 'nvidia/parakeet-tdt-1.1b') or model key (e.g., 'parakeet-tdt-0.6b-v3').
  * @param {Object} [options]
- * @param {('int8'|'fp32'|'fp16')} [options.encoderQuant]
- * @param {('int8'|'fp32'|'fp16')} [options.decoderQuant]
- * @param {('js'|'onnx')} [options.preprocessorBackend]
- * @param {(progress: {loaded: number, total: number, file: string}) => void} [options.progress]
- * @returns {Promise<Object>}
+ * @param {('int8'|'fp32'|'fp16')} [options.encoderQuant='int8'] Encoder quantization.
+ * @param {('int8'|'fp32'|'fp16')} [options.decoderQuant='int8'] Decoder quantization.
+ * @param {('nemo80'|'nemo128')} [options.preprocessor] Preprocessor variant (auto-detected from model config if not specified).
+ * @param {('js'|'onnx')} [options.preprocessorBackend='js'] Preprocessor backend selection.
+ * @param {('webgpu'|'webgpu-hybrid'|'webgpu-strict'|'wasm')} [options.backend='webgpu'] Backend mode (`webgpu` alias is accepted for compatibility).
+ * @param {(progress: {loaded: number, total: number, file: string}) => void} [options.progress] Progress callback.
+ * @returns {Promise<{urls: {encoderUrl: string, decoderUrl: string, tokenizerUrl: string, preprocessorUrl?: string, encoderDataUrl?: string|null, decoderDataUrl?: string|null}, filenames: {encoder: string, decoder: string}, quantisation: {encoder: ('int8'|'fp32'|'fp16'), decoder: ('int8'|'fp32'|'fp16')}, modelConfig: ModelConfig|null, preprocessorBackend: ('js'|'onnx')}>}
  */
 export async function getParakeetModel(repoIdOrModelKey, options = {}) {
-  log('getParakeetModel called:', repoIdOrModelKey, options);
   const modelConfig = getModelConfig(repoIdOrModelKey);
   const repoId = modelConfig?.repoId || repoIdOrModelKey;
   const defaultPreprocessor = modelConfig?.preprocessor || 'nemo128';
 
   const {
-    encoderQuant = 'fp32',
-    decoderQuant = 'fp32',
+    encoderQuant = 'int8',
+    decoderQuant = 'int8',
+    preprocessor = defaultPreprocessor,
     preprocessorBackend = 'js',
+    backend = 'webgpu',
     progress,
+    verbose = false,
   } = options;
 
-  // Force fp32 for encoder on WebGPU (int8 not supported)
-  let backend = options.backend || 'webgpu';
   let encoderQ = encoderQuant;
-  // Handle cpu backend - treat as non-webgpu
-  if (backend === 'cpu') {
-    backend = 'wasm';
-  }
   if (backend.startsWith('webgpu') && encoderQ === 'int8') {
-    warn('Forcing encoder to fp32 on WebGPU (int8 unsupported)');
+    console.warn('[Hub] Forcing encoder to fp32 on WebGPU (int8 unsupported)');
     encoderQ = 'fp32';
   }
-
-  log('Model config:', { repoId, encoderQ, decoderQuant, preprocessorBackend, backend });
 
   const components = {
     encoder: createComponent('encoder', encoderQ),
     decoder: createComponent('decoder', decoderQuant),
   };
 
-  log('Fetching repo files...');
   const repoFiles = await listRepoFiles(repoId, options.revision || 'main');
-  log('Repo files:', repoFiles?.length || 0, 'files');
 
   validateRequestedFp16Component(components.encoder, repoId, repoFiles);
   validateRequestedFp16Component(components.decoder, repoId, repoFiles);
 
-  const requiredFiles = buildRequiredDownloads(components, preprocessorBackend, defaultPreprocessor);
-  log('Required files:', requiredFiles.map(f => f.name));
+  const requiredFiles = buildRequiredDownloads(components, preprocessorBackend, preprocessor, verbose);
 
   const results = {
     urls: {},
@@ -448,14 +458,19 @@ export async function getParakeetModel(repoIdOrModelKey, options = {}) {
     try {
       results.urls[file.key] = await getModelFile(repoId, file.name, { ...options, progress });
     } catch (err) {
-      if (!file.componentName) throw err;
+      if (!file.componentName) {
+        throw err;
+      }
 
       const component = components[file.componentName];
       if (component.quant === 'fp16') {
         throw new Error(
-          `[Hub] ${component.name} FP16 failed (${file.name}). Use fp32 explicitly.`
+          `[Hub] ${component.name} FP16 download failed (${file.name}). ` +
+          `Requested quantization is strict; choose encoderQuant/decoderQuant='fp32' explicitly. ` +
+          `Original error: ${err.message || err}`
         );
       }
+
       throw err;
     }
   }
@@ -465,7 +480,7 @@ export async function getParakeetModel(repoIdOrModelKey, options = {}) {
     try {
       results.urls[file.key] = await getModelFile(repoId, file.name, { ...options, progress });
     } catch {
-      console.warn(`[Hub] Optional file not found: ${file.name}`);
+      console.warn(`[Hub] Optional external data file not found: ${file.name}. This is expected if the model is small.`);
       results.urls[file.key] = null;
     }
   }
