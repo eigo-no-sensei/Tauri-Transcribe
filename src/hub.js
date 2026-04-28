@@ -350,6 +350,7 @@ function validateRequestedFp16Component(component, repoId, repoFiles) {
  */
 function buildRequiredDownloads(components, preprocessorBackend, preprocessor) {
   const files = [
+    { key: 'configUrl', name: 'config.json', optional: false },
     { key: components.encoder.key, name: components.encoder.filename, componentName: 'encoder', optional: false },
     { key: components.decoder.key, name: components.decoder.filename, componentName: 'decoder', optional: false },
     { key: 'tokenizerUrl', name: 'vocab.txt', optional: false },
