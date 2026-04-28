@@ -90,7 +90,7 @@
    - File validation with clear error messages
 
 2. **Model Management**
-   - Load parakeet-v2-0.6B model from transformers.js
+   - Load Unravler/parakeet-tdt-0.6b-v2-onnx model from transformers.js
    - WebGPU backend
    - Model caching in app data directory
    - Progress indication during download/load
@@ -135,7 +135,7 @@
 - **Build**: Vite
 
 ### Model Configuration
-- **Model**: Xenova/parakeet-v2-0.6B
+- **Model**: Unravler/parakeet-tdt-0.6b-v2-onnx
 - **Backend**: WebGPU
 - **Task**: automatic-speech-recognition
 

@@ -3,7 +3,7 @@ Tauri-based cross-platform transcription app using transformers.js with WebGPU a
 
 ## Features
 - Audio/Video to text transcription
-- Uses parakeet-v2-0.6B model via transformers.js v4
+- Uses Unravler/parakeet-tdt-0.6b-v2-onnx model via transformers.js v4
 - WebGPU acceleration for fast inference
 - Model caching between runs
 - Clean dark theme interface
