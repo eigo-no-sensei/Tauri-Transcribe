@@ -1,11 +1,18 @@
 import { useState, useRef, useCallback, useEffect, type FC } from 'react';
 import { pipeline, env } from '@huggingface/transformers';
 
-// Configure transformers.js to use WebGPU and enable caching
+// Configure transformers.js
+// Use browser cache for model caching
 env.useBrowserCache = true;
-env.allowLocalModels = true;
+// Allow loading models from Hugging Face Hub
+env.allowLocalModels = false;
 
+// Model configuration - using the ONNX version for browser inference
 const MODEL_ID = 'Unravler/parakeet-tdt-0.6b-v2-onnx';
+
+// Available backends - webgpu with wasm fallback
+const AVAILABLE_BACKENDS = ['webgpu', 'cpu'] as const;
+type BackendType = typeof AVAILABLE_BACKENDS[number];
 
 // Type for the ASR pipeline
 type ASRPipeline = Awaited<ReturnType<typeof pipeline<'automatic-speech-recognition'>>>;
@@ -81,7 +88,9 @@ export default function App() {
   const [stats, setStats] = useState<Stats | null>(null);
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
   const [isDragOver, setIsDragOver] = useState(false);
-  const [webgpuAvailable, setWebgpuAvailable] = useState(true);
+  
+  // Check WebGPU availability and preferred backend
+  const [preferredBackend, setPreferredBackend] = useState<BackendType>('webgpu');
   
   const fileInputRef = useRef<HTMLInputElement>(null);
   const transcriberRef = useRef<ASRPipeline | null>(null);
@@ -89,19 +98,36 @@ export default function App() {
 
   // Check WebGPU availability on mount
   useEffect(() => {
-    const checkWebGPU = async () => {
+    const checkBackend = async () => {
       try {
+        // Try to detect WebGPU support
         // @ts-expect-error navigator.gpu may not exist on all types
-        if (typeof navigator.gpu === 'undefined') {
-          setWebgpuAvailable(false);
-          setStatusMessage('WebGPU not available - using fallback');
+        const hasNvidiaGpu = typeof navigator.gpu !== 'undefined';
+        
+        if (!hasNvidiaGpu) {
+          console.warn('[App] WebGPU not available, will use CPU backend');
+          setPreferredBackend('cpu');
+          setStatusMessage('WebGPU not available - using CPU fallback');
+          return;
         }
-      } catch {
-        setWebgpuAvailable(false);
-        setStatusMessage('WebGPU check failed');
+
+        // Try to request a GPU adapter to verify actual WebGPU support
+        // @ts-expect-error navigator.gpu may not exist
+        const adapter = await navigator.gpu.requestAdapter();
+        if (!adapter) {
+          console.warn('[App] WebGPU adapter not available, using CPU fallback');
+          setPreferredBackend('cpu');
+          setStatusMessage('WebGPU adapter unavailable - using CPU fallback');
+        } else {
+          console.log('[App] WebGPU available, using webgpu backend');
+        }
+      } catch (error) {
+        console.warn('[App] WebGPU check failed:', error);
+        setPreferredBackend('cpu');
+        setStatusMessage('WebGPU check failed - using CPU fallback');
       }
     };
-    checkWebGPU();
+    checkBackend();
   }, []);
 
   const handleFileSelect = useCallback((file: File) => {
@@ -146,30 +172,32 @@ export default function App() {
 
     setModelStatus('downloading');
     setProgress(0);
-    setStatusMessage('Initializing WebGPU backend...');
+    setStatusMessage('Initializing model backend...');
 
     try {
-      // Progress callback for model downloading
-      const progressCallback = (progress: { progress?: number; status?: string }) => {
+      // Progress callback for model loading
+      const progressCallback = (progress: { progress?: number; status?: string; file?: string }) => {
         if (progress.status) {
+          console.log('[Model] Status:', progress.status);
           setStatusMessage(progress.status);
         }
+        // progress.progress is only available in some stages (0-1 range)
         if (progress.progress !== undefined) {
-          setProgress(progress.progress);
+          setProgress(Math.round(progress.progress * 100));
         }
       };
 
       setModelStatus('loading');
-      setStatusMessage('Loading model...');
-      setProgress(50);
+      setStatusMessage(`Loading model with ${preferredBackend} backend...`);
 
-      // Load the ASR pipeline with WebGPU device
+      // Load the ASR pipeline
+      // transformers.js handles the actual model loading with the specified backend
       transcriberRef.current = await pipeline(
         'automatic-speech-recognition',
         MODEL_ID,
         {
           progress_callback: progressCallback,
-          device: 'webgpu',
+          device: preferredBackend,
         }
       );
 
@@ -178,12 +206,47 @@ export default function App() {
       setStatusMessage('Model ready');
       setToast({ message: 'Model loaded successfully', type: 'success' });
     } catch (error) {
-      console.error('Model loading error:', error);
+      console.error('[Model] Loading error:', error);
+      
+      // If WebGPU failed, try with CPU fallback
+      if (preferredBackend === 'webgpu' && error instanceof Error) {
+        console.warn('[Model] WebGPU failed, retrying with CPU...');
+        setPreferredBackend('cpu');
+        setModelStatus('idle');
+        setProgress(0);
+        setStatusMessage('WebGPU failed, retrying with CPU...');
+        
+        // Retry with CPU
+        try {
+          transcriberRef.current = await pipeline(
+            'automatic-speech-recognition',
+            MODEL_ID,
+            {
+              progress_callback: (p: { progress?: number; status?: string; file?: string }) => {
+                if (p.status) setStatusMessage(p.status);
+                if (p.progress !== undefined) setProgress(Math.round(p.progress * 100));
+              },
+              device: 'cpu',
+            }
+          );
+          setModelStatus('ready');
+          setProgress(100);
+          setStatusMessage('Model ready (CPU mode)');
+          setToast({ message: 'Model loaded with CPU fallback', type: 'success' });
+        } catch (cpuError) {
+          console.error('[Model] CPU fallback error:', cpuError);
+          setModelStatus('error');
+          setStatusMessage(cpuError instanceof Error ? cpuError.message : 'Failed to load model');
+          setToast({ message: 'Failed to load model', type: 'error' });
+        }
+        return;
+      }
+      
       setModelStatus('error');
       setStatusMessage(error instanceof Error ? error.message : 'Failed to load model');
       setToast({ message: 'Failed to load model', type: 'error' });
     }
-  }, [modelStatus]);
+  }, [preferredBackend]);
 
   const transcribe = useCallback(async () => {
     if (!selectedFile || !transcriberRef.current) return;
@@ -270,10 +333,9 @@ export default function App() {
   };
 
   const getStatusText = () => {
-    if (!webgpuAvailable) return 'WebGPU unavailable';
     switch (modelStatus) {
-      case 'idle': return 'Not loaded';
-      case 'downloading': return 'Downloading...';
+      case 'idle': return `Not loaded (${preferredBackend})`;
+      case 'downloading': return 'Preparing...';
       case 'loading': return 'Loading...';
       case 'ready': return 'Ready';
       case 'error': return 'Error';
@@ -329,7 +391,7 @@ export default function App() {
           <button
             className="btn btn-primary"
             onClick={loadModel}
-            disabled={modelStatus === 'loading' || modelStatus === 'downloading' || !webgpuAvailable}
+            disabled={modelStatus === 'loading' || modelStatus === 'downloading'}
           >
             {(modelStatus === 'loading' || modelStatus === 'downloading') ? (
               <>
@@ -365,12 +427,6 @@ export default function App() {
             </div>
           )}
         </div>
-        
-        {!webgpuAvailable && (
-          <p className="error-message">
-            WebGPU is not available. Please use a browser with WebGPU support.
-          </p>
-        )}
       </section>
 
       <section className="card transcription-area">
