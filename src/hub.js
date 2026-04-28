@@ -395,8 +395,8 @@ export async function getParakeetModel(repoIdOrModelKey, options = {}) {
   const defaultPreprocessor = modelConfig?.preprocessor || 'nemo128';
 
   const {
-    encoderQuant = 'int8',
-    decoderQuant = 'int8',
+    encoderQuant = 'fp32',
+    decoderQuant = 'fp32',
     preprocessorBackend = 'js',
     progress,
   } = options;
