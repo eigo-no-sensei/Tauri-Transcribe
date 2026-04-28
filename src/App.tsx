@@ -1,16 +1,18 @@
 import { useState, useRef, useCallback, useEffect, type FC } from 'react';
 import { pipeline, env } from '@huggingface/transformers';
+import { getModelConfig, DEFAULT_MODEL } from './models.js';
+import { getParakeetModel } from './hub.js';
 
 // Configure transformers.js
-// Use browser cache for model caching
 env.useBrowserCache = true;
-// Allow loading models from Hugging Face Hub
 env.allowLocalModels = false;
 
-// Model configuration - using the ONNX version for browser inference
-const MODEL_ID = 'Unravler/parakeet-tdt-0.6b-v2-onnx';
+// Model configuration using models.js
+const MODEL_KEY = DEFAULT_MODEL;
+const MODEL_CONFIG = getModelConfig(MODEL_KEY);
+const MODEL_ID = MODEL_CONFIG?.repoId || 'Unravler/parakeet-tdt-0.6b-v2-onnx';
 
-// Available backends - webgpu with wasm fallback
+// Available backends
 const AVAILABLE_BACKENDS = ['webgpu', 'cpu'] as const;
 type BackendType = typeof AVAILABLE_BACKENDS[number];
 
@@ -172,26 +174,44 @@ export default function App() {
 
     setModelStatus('downloading');
     setProgress(0);
-    setStatusMessage('Initializing model backend...');
+    setStatusMessage('Checking model availability...');
 
     try {
-      // Progress callback for model loading
-      const progressCallback = (progress: { progress?: number; status?: string; file?: string }) => {
-        if (progress.status) {
-          console.log('[Model] Status:', progress.status);
-          setStatusMessage(progress.status);
+      // First, verify model files are available using hub.js
+      // This queries the HuggingFace API to list available files
+      setModelStatus('loading');
+      setStatusMessage(`Fetching model info from HuggingFace...`);
+      
+      const progressCallback = (p: { status?: string; progress?: number; file?: string }) => {
+        if (p.status) {
+          setStatusMessage(p.status);
         }
-        // progress.progress is only available in some stages (0-1 range)
-        if (progress.progress !== undefined) {
-          setProgress(Math.round(progress.progress * 100));
+        if (p.file) {
+          setStatusMessage(`Downloading ${p.file}...`);
+        }
+        if (p.progress !== undefined) {
+          setProgress(Math.round(p.progress * 100));
         }
       };
 
-      setModelStatus('loading');
+      // Use getParakeetModel to verify model is available
+      // and get the file URLs with proper quantization
+      const modelInfo = await getParakeetModel(MODEL_KEY, {
+        backend: preferredBackend,
+        progress: progressCallback,
+      });
+      
+      console.log('[Model] Model info:', {
+        model: MODEL_KEY,
+        repo: MODEL_ID,
+        files: modelInfo.filenames,
+        quant: modelInfo.quantisation,
+        preprocessor: modelInfo.preprocessorBackend,
+      });
+
       setStatusMessage(`Loading model with ${preferredBackend} backend...`);
 
-      // Load the ASR pipeline
-      // transformers.js handles the actual model loading with the specified backend
+      // Load the ASR pipeline with the verified model
       transcriberRef.current = await pipeline(
         'automatic-speech-recognition',
         MODEL_ID,
@@ -216,14 +236,14 @@ export default function App() {
         setProgress(0);
         setStatusMessage('WebGPU failed, retrying with CPU...');
         
-        // Retry with CPU
         try {
           transcriberRef.current = await pipeline(
             'automatic-speech-recognition',
             MODEL_ID,
             {
-              progress_callback: (p: { progress?: number; status?: string; file?: string }) => {
+              progress_callback: (p: { status?: string; progress?: number; file?: string }) => {
                 if (p.status) setStatusMessage(p.status);
+                if (p.file) setStatusMessage(`Downloading ${p.file}...`);
                 if (p.progress !== undefined) setProgress(Math.round(p.progress * 100));
               },
               device: 'cpu',
