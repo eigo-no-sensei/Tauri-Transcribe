@@ -212,19 +212,46 @@ export default function App() {
       setStatusMessage(`Loading model with ${preferredBackend} backend...`);
 
       // Load the ASR pipeline with the verified model
-      transcriberRef.current = await pipeline(
-        'automatic-speech-recognition',
-        MODEL_ID,
-        {
-          progress_callback: progressCallback,
-          device: preferredBackend,
+      // Add retries for network errors
+      let lastError: Error | null = null;
+      const maxRetries = 3;
+      
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+          setStatusMessage(`Loading model (attempt ${attempt}/${maxRetries})...`);
+          
+          transcriberRef.current = await pipeline(
+            'automatic-speech-recognition',
+            MODEL_ID,
+            {
+              progress_callback: progressCallback,
+              device: preferredBackend,
+            }
+          );
+          
+          setModelStatus('ready');
+          setProgress(100);
+          setStatusMessage('Model ready');
+          setToast({ message: 'Model loaded successfully', type: 'success' });
+          return; // Success, exit the function
+        } catch (err) {
+          lastError = err instanceof Error ? err : new Error(String(err));
+          console.error(`[Model] Attempt ${attempt} failed:`, lastError.message);
+          
+          if (attempt < maxRetries) {
+            // Check if it's a network error that might succeed on retry
+            if (lastError.message.includes('fetch') || lastError.message.includes('JSON') || lastError.message.includes('network') || lastError.message.includes('Failed to fetch')) {
+              setStatusMessage(`Retrying in ${attempt * 2}s...`);
+              await new Promise(r => setTimeout(r, attempt * 2000));
+              continue;
+            }
+            // For non-network errors, don't retry
+            break;
+          }
         }
-      );
-
-      setModelStatus('ready');
-      setProgress(100);
-      setStatusMessage('Model ready');
-      setToast({ message: 'Model loaded successfully', type: 'success' });
+      }
+      
+      throw lastError;
     } catch (error) {
       console.error('[Model] Loading error:', error);
       
